@@ -188,9 +188,7 @@ depend on HTTP or the repository.
 
 ## Workflow checks
 
-The baseline intentionally has no automated test suite. Tests are deferred to
-the later task stage, which will add red/green verification coverage. The
-current production workflow checks are:
+The production workflow checks exercise the public HTTP boundary:
 
 ```bash
 python3 scripts/workflow_checks.py ingest-media-asset
@@ -200,6 +198,46 @@ python3 scripts/workflow_checks.py verify-reproduction
 
 Each check starts a temporary HTTP server, generates media bytes in memory,
 exercises the public endpoints, and shuts the server down.
+
+### Shared media and save-failure evidence
+
+A fourth check targets a question the per-workflow checks cannot answer: what
+happens when two requests reference the same media bytes and one of them fails
+while saving its record.
+
+```bash
+python3 scripts/workflow_checks.py shared-media-save-failure
+python3 scripts/run_failure_contract_tests.py --repeats 3
+```
+
+The scenario puts both requests at the same content-addressed boundary with
+barriers (not sleeps), makes each observe the blob as absent, and injects one
+deterministic commit failure after the other request has committed. The check
+then requires that the surviving WAV or Y4M:
+
+- still hashes and describes exactly as its durable record says;
+- still supports a later derivation and a fresh integrity check;
+- keeps the completed rendition's status, lineage, and output consistent;
+- behaves the same after a fresh application opens the same data directory.
+
+On the current implementation this check exits nonzero. A failed request
+removes the shared content-addressed blob even though another request already
+references it, so the survivor's record points at missing bytes and later
+derivations or integrity checks report `PERSISTENCE_FAILURE` or
+`INTEGRITY_MISMATCH`. The contract suite reports the exact violation codes and
+the recorded request ordering on every repeat. The check and the suite are
+retained as reproducible evidence; they must not be skipped or weakened to
+produce a green result without a production fix.
+
+### Regression suite
+
+```bash
+python3 -m unittest discover -s tests -t . -v
+```
+
+The suite includes deterministic positive controls (repeated identical
+ingests, isolated save failures) so the failure scenarios are measured against
+known-good behavior rather than a hardcoded expectation.
 
 ## Environment
 

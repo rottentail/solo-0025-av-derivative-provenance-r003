@@ -4,8 +4,12 @@
   "source_extensions": [
     ".py"
   ],
-  "build_command": "python3 -m compileall -q avprovenance scripts",
-  "testing": "deferred",
+  "build_command": "python3 -m compileall -q avprovenance scripts tests",
+  "testing": {
+    "unit_suite": "python3 -m unittest discover -s tests -t . -v",
+    "expected": "positive controls pass; shared-blob failure scenarios fail on the current implementation",
+    "evidence_runner": "python3 scripts/run_failure_contract_tests.py --repeats 3"
+  },
   "workflow_checks": [
     {
       "workflow_id": "ingest-media-asset",
@@ -18,6 +22,12 @@
     {
       "workflow_id": "verify-reproduction",
       "command": "python3 scripts/workflow_checks.py verify-reproduction"
+    },
+    {
+      "workflow_id": "shared-media-save-failure",
+      "command": "python3 scripts/workflow_checks.py shared-media-save-failure",
+      "expected_result": "nonzero until shared-blob rollback is fixed by production code",
+      "evidence_runner": "python3 scripts/run_failure_contract_tests.py --repeats 3"
     }
   ]
 }

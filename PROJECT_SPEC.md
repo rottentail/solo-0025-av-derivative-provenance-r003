@@ -258,20 +258,40 @@ leaking local paths.
 
 ## Validation plan
 
-The project intentionally defers automated tests to the later task stage.
-Until that stage adds a verification suite, the following production workflow
-checks are the baseline:
+Verification has two layers.
+
+Production workflow checks start an ephemeral HTTP server, generate bounded
+media bytes in memory, call the public endpoints, and assert observable state.
+They do not require network access or external media programs.
 
 ```bash
-python3 -m compileall -q avprovenance scripts
+python3 -m compileall -q avprovenance scripts tests
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py shared-media-save-failure
 ```
 
-The checks start an ephemeral HTTP server, generate bounded media bytes in
-memory, call the public endpoints, and assert observable state. They do not
-require network access or external media programs.
+The regression suite in `tests/` covers the same workflows plus the
+content-addressing and failure semantics that the workflow checks cannot show
+on their own:
+
+```bash
+python3 -m unittest discover -s tests -t . -v
+python3 scripts/run_failure_contract_tests.py --repeats 3
+```
+
+The shared-media scenarios place two requests at the same content-addressed
+boundary with barriers rather than sleeps, inject one deterministic commit
+failure, and then verify the survivor's status, descriptor, lineage, actual
+on-disk bytes, later derivability, and reproduction result both before and
+after a fresh application opens the same data directory.
+
+The `shared-media-save-failure` workflow check is expected to exit nonzero
+until production rollback logic distinguishes "I created this blob" from
+"another request already relies on it". The contract suite and that workflow
+check are evidence of the defect; they must not be skipped, weakened, or
+rewritten to pass without a production fix.
 
 ## Intentionally omitted capabilities
 
@@ -279,4 +299,4 @@ require network access or external media programs.
 - Persistent worker processes and cross-process task leases.
 - Authentication and multi-tenant authorization.
 - Object storage and distributed state.
-- Automated tests, which belong to the later task stage.
+- A green `shared-media-save-failure` result; see the validation plan above.

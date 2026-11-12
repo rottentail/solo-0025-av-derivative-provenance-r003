@@ -1,171 +1,64 @@
 #!/usr/bin/env python3
-"""Run bounded production workflow checks against an ephemeral HTTP server."""
+"""Run bounded production workflow checks against an ephemeral HTTP server.
+
+Each check starts a fresh server over a temporary data directory and exercises
+only the public HTTP surface.  The checks share the same deterministic media
+generators as the regression suite so workflow evidence and contract evidence
+cannot drift apart.
+
+The ``shared-media-save-failure`` workflow is different on purpose: it arranges
+two concurrent requests to reach the same content-addressed blob before either
+commits, injects a storage failure in exactly one of them, and reports what
+survived.  It exits nonzero when any promised invariant is violated; it never
+substitutes a green result for a failing one.
+"""
 
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
-import http.client
-import io
 import json
-import math
-import struct
 import sys
 import tempfile
-import threading
-import wave
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
-
+from contextlib import contextmanager
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from avprovenance.http_api import ProvenanceHTTPServer, build_http_server
+from avprovenance.http_api import ProvenanceHTTPServer
+from tests.scenarios import (
+    MEDIA_KINDS,
+    run_isolated_save_failure_scenario,
+    run_repeat_ingest_scenario,
+    run_shared_blob_ingest_scenario,
+    run_shared_blob_rendition_scenario,
+)
+from tests.support import (
+    HTTPClient,
+    make_wav,
+    make_y4m,
+    require,
+    require_equal,
+    running_server,
+    sha256_bytes,
+)
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def make_wav(
-    *,
-    frequency: float,
-    duration_seconds: float = 0.6,
-    sample_rate: int = 8000,
-    amplitude: int = 9000,
-) -> bytes:
-    frame_count = int(duration_seconds * sample_rate)
-    values = [
-        int(amplitude * math.sin(2 * math.pi * frequency * index / sample_rate))
-        for index in range(frame_count)
-    ]
-    payload = io.BytesIO()
-    with wave.open(payload, "wb") as writer:
-        writer.setnchannels(1)
-        writer.setsampwidth(2)
-        writer.setframerate(sample_rate)
-        writer.writeframes(struct.pack(f"<{len(values)}h", *values))
-    return payload.getvalue()
-
-
-def make_y4m(
-    *,
-    width: int = 64,
-    height: int = 36,
-    frame_count: int = 5,
-    rate_numerator: int = 12,
-    rate_denominator: int = 1,
-) -> bytes:
-    header = (
-        "YUV4MPEG2 "
-        f"W{width} H{height} "
-        f"F{rate_numerator}:{rate_denominator} "
-        "Ip C420jpeg\n"
-    ).encode("ascii")
-    chroma_width = width // 2
-    chroma_height = height // 2
-    parts = [header]
-    for frame_index in range(frame_count):
-        parts.append(b"FRAME\n")
-        y_plane = bytes(
-            (x * 3 + y * 5 + frame_index * 11) % 256
-            for y in range(height)
-            for x in range(width)
-        )
-        u_plane = bytes(
-            (96 + x * 2 + frame_index * 3) % 256
-            for _y in range(chroma_height)
-            for x in range(chroma_width)
-        )
-        v_plane = bytes(
-            (144 + y * 2 + frame_index * 5) % 256
-            for y in range(chroma_height)
-            for _x in range(chroma_width)
-        )
-        parts.extend((y_plane, u_plane, v_plane))
-    return b"".join(parts)
-
-
-class HTTPClient:
-    def __init__(self, host: str, port: int) -> None:
-        self.host = host
-        self.port = port
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        payload: dict[str, Any] | None = None,
-    ) -> tuple[int, dict[str, Any]]:
-        connection = http.client.HTTPConnection(
-            self.host,
-            self.port,
-            timeout=15,
-        )
-        body = None
-        headers = {"Accept": "application/json"}
-        if payload is not None:
-            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-            headers["Content-Length"] = str(len(body))
-        try:
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            raw = response.read()
-            value = json.loads(raw.decode("utf-8"))
-            return response.status, value
-        finally:
-            connection.close()
-
-    def upload(self, filename: str, data: bytes) -> dict[str, Any]:
-        status, body = self.request(
-            "POST",
-            "/v1/assets",
-            {
-                "filename": filename,
-                "data_base64": base64.b64encode(data).decode("ascii"),
-            },
-        )
-        require_equal(status, 201, "asset upload status")
-        return body
-
-    def create_rendition(self, payload: dict[str, Any]) -> dict[str, Any]:
-        status, body = self.request("POST", "/v1/renditions", payload)
-        require_equal(status, 201, "rendition creation status")
-        return body
+WORKFLOWS = (
+    "ingest-media-asset",
+    "execute-rendition",
+    "verify-reproduction",
+    "shared-media-save-failure",
+)
 
 
 @contextmanager
-def running_server() -> Iterator[tuple[HTTPClient, ProvenanceHTTPServer]]:
+def _check_server() -> Iterator[tuple[HTTPClient, ProvenanceHTTPServer]]:
     with tempfile.TemporaryDirectory(prefix="avprovenance-check-") as temporary:
-        server = build_http_server("127.0.0.1", 0, Path(temporary))
-        thread = threading.Thread(
-            target=server.serve_forever,
-            kwargs={"poll_interval": 0.02},
-            daemon=True,
-        )
-        thread.start()
-        host, port = server.server_address[:2]
-        try:
-            yield HTTPClient(str(host), int(port)), server
-        finally:
-            server.shutdown()
-            thread.join(timeout=5)
-            server.server_close()
-
-
-def require_equal(actual: Any, expected: Any, label: str) -> None:
-    if actual != expected:
-        raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-def require(condition: bool, message: str) -> None:
-    if not condition:
-        raise AssertionError(message)
+        with running_server(Path(temporary)) as pair:
+            yield pair
 
 
 def run_ingest_media_asset(client: HTTPClient) -> dict[str, Any]:
@@ -176,7 +69,7 @@ def run_ingest_media_asset(client: HTTPClient) -> dict[str, Any]:
     audio = make_wav(frequency=330)
     asset = client.upload("tone-source.wav", audio)
     require_equal(asset["kind"], "audio", "asset kind")
-    require_equal(asset["sha256"], _sha256(audio), "asset digest")
+    require_equal(asset["sha256"], sha256_bytes(audio), "asset digest")
     require_equal(asset["descriptor"]["container"], "wav", "asset container")
     require("content_key" not in asset, "public asset exposed an internal content key")
 
@@ -189,7 +82,7 @@ def run_ingest_media_asset(client: HTTPClient) -> dict[str, Any]:
         "/v1/assets",
         {
             "filename": "unknown.bin",
-            "data_base64": base64.b64encode(b"not-media").decode("ascii"),
+            "data_base64": "bm90LW1lZGlh",
         },
     )
     require_equal(bad_status, 415, "unsupported media status")
@@ -393,19 +286,53 @@ def run_verify_reproduction(
     }
 
 
+def _shared_media_save_failure() -> tuple[dict[str, Any], bool]:
+    """Report the shared-blob/save-failure contract and whether it holds.
+
+    Positive controls always run first.  If either of them fails, the evidence
+    is still fully reported, but the workflow result is unreliable and the
+    exit status stays nonzero.
+    """
+
+    reports: list[dict[str, Any]] = []
+    healthy = True
+    for media_kind in MEDIA_KINDS:
+        report = run_repeat_ingest_scenario(media_kind)
+        reports.append(report)
+        healthy = healthy and report["contract"] == "held"
+    isolated = run_isolated_save_failure_scenario()
+    reports.append(isolated)
+    healthy = healthy and isolated["contract"] == "held"
+
+    for media_kind in MEDIA_KINDS:
+        reports.append(run_shared_blob_ingest_scenario(media_kind))
+    for media_kind in MEDIA_KINDS:
+        reports.append(run_shared_blob_rendition_scenario(media_kind))
+
+    violated = [report for report in reports if report["contract"] != "held"]
+    result = {
+        "workflow": "shared-media-save-failure",
+        "contracts_held": not violated,
+        "positive_controls_healthy": healthy,
+        "violated_scenarios": sorted(
+            {report["scenario"] for report in violated}
+        ),
+        "reports": reports,
+    }
+    return result, not violated and healthy
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "workflow",
-        choices=(
-            "ingest-media-asset",
-            "execute-rendition",
-            "verify-reproduction",
-        ),
-    )
+    parser.add_argument("workflow", choices=WORKFLOWS)
     args = parser.parse_args()
 
-    with running_server() as (client, server):
+    if args.workflow == "shared-media-save-failure":
+        result, contract_held = _shared_media_save_failure()
+        print(json.dumps(result, sort_keys=True))
+        return 0 if contract_held else 1
+
+    with _check_server() as (client, server):
         if args.workflow == "ingest-media-asset":
             result = run_ingest_media_asset(client)
         elif args.workflow == "execute-rendition":
